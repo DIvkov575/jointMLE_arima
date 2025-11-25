@@ -1,417 +1,171 @@
 import numpy as np
-from scipy.optimize import minimize
+from sklearn.linear_model import LinearRegression, Ridge
 import warnings
 
-class MultiSeriesARIMA:
+class ARIMA:
     """
-    Multi-series ARIMA(p,d,q) with shared parameters across multiple univariate time series.
+    Direct Multi-Horizon Autoregressive Integrated (ARI) Model.
     
-    Fits a single set of ARIMA parameters to multiple series via Maximum Likelihood Estimation.
-    Provides forecasts in the original (undifferenced) scale with proper inverse transformation.
+    Instead of recursive forecasting (which accumulates error), this model 
+    trains a separate regression model for each forecast horizon to directly 
+    predict y_{t+h} from y_{t}, y_{t-1}, ...
     
-    Parameters:
-    -----------
-    p : int
-        Order of autoregressive component (number of AR lags)
-    d : int
-        Order of differencing (0 = no differencing, 1 = first difference, etc.)
-    q : int
-        Order of moving average component (number of MA lags)
+    Structure:
+    1. Differencing (d) to make stationary
+    2. Lag features (p) creation
+    3. Linear Regression for each horizon h: y'_{t+h} = f_h(y'_t, y'_{t-1}, ...)
+    4. Inverse differencing to get final forecast
     """
-    def __init__(self, p=1, d=0, q=0):
-        if p < 0 or d < 0 or q < 0:
-            raise ValueError("Orders p, d, q must be non-negative integers")
-        if p == 0 and q == 0:
-            raise ValueError("At least one of p or q must be positive for ARIMA model")
-            
+    def __init__(self, p=1, d=1, q=0, ridge_alpha=0.0):
         self.p = p
         self.d = d
-        self.q = q
-        self.params_ = None  # θ = [c, φ_1,...,φ_p, θ_1,...,θ_q, log(σ^2)]
+        self.q = q  # MA not supported in direct linear implementation
+        self.ridge_alpha = ridge_alpha
+        self.models = {}  # Dictionary to store model for each horizon
         self.fitted_ = False
-        self.series_history_ = None  # Store original series for inverse differencing
         
-    def difference(self, series, return_history=False):
-        """
-        Apply differencing of order d to a single series.
-        
-        Parameters:
-        -----------
-        series : array-like
-            Time series to difference
-        return_history : bool
-            If True, return differencing history needed for inverse transform
-            
-        Returns:
-        --------
-        z : ndarray
-            Differenced series
-        history : list of arrays (optional)
-            Initial values from each differencing step
-        """
+    def difference(self, series):
+        """Apply differencing of order d."""
         z = np.asarray(series, dtype=float)
         history = []
-        
         for _ in range(self.d):
-            if return_history:
-                history.append(z[0])  # Store first value before differencing
+            history.append(z[0])
             z = np.diff(z)
-            
-        if return_history:
-            return z, history
-        return z
+        return z, history
     
     def inverse_difference(self, z_diff, history):
-        """
-        Reverse differencing to return to original scale.
-        
-        Parameters:
-        -----------
-        z_diff : array-like
-            Differenced values to transform back
-        history : list of arrays
-            Initial values from each differencing step (from difference method)
-            
-        Returns:
-        --------
-        z_original : ndarray
-            Values in original scale
-        """
+        """Reverse differencing."""
         z = np.asarray(z_diff, dtype=float)
-        
-        # Reverse differencing in opposite order
         for initial_val in reversed(history):
             z = np.cumsum(np.concatenate([[initial_val], z]))
-            
         return z
     
-    def compute_residuals(self, z, params):
-        """
-        Compute recursive residuals for a single differenced series.
-        
-        ARIMA equation: z[t] = c + Σφᵢz[t-i] + Σθⱼe[t-j] + e[t]
-        Therefore: e[t] = z[t] - c - Σφᵢz[t-i] - Σθⱼe[t-j]
-        
-        Parameters:
-        -----------
-        z : array-like
-            Differenced series
-        params : array-like
-            Parameters [c, φ_1,...,φ_p, θ_1,...,θ_q]
+    def create_lag_features(self, series):
+        """Create lag features matrix X and target vector y for 1-step ahead."""
+        X, y = [], []
+        if len(series) <= self.p:
+            return np.array([]), np.array([])
             
-        Returns:
-        --------
-        e : ndarray
-            Residuals
-        """
-        c = params[0]
-        phi = params[1:1+self.p] if self.p > 0 else np.array([])
-        theta = params[1+self.p:1+self.p+self.q] if self.q > 0 else np.array([])
-        
-        T = len(z)
-        e = np.zeros(T)
-        
-        for t in range(T):
-            # AR component: use past observations
-            ar_term = 0.0
-            for i in range(self.p):
-                if t - i - 1 >= 0:
-                    ar_term += phi[i] * z[t - i - 1]
+        for i in range(self.p, len(series)):
+            X.append(series[i-self.p:i][::-1]) # Reverse so index 0 is lag 1
+            y.append(series[i])
             
-            # MA component: use past residuals
-            ma_term = 0.0
-            for j in range(self.q):
-                if t - j - 1 >= 0:
-                    ma_term += theta[j] * e[t - j - 1]
-            
-            # Compute residual
-            e[t] = z[t] - c - ar_term - ma_term
-            
-        return e
-    
-    def check_stationarity(self, phi):
+        return np.array(X), np.array(y)
+
+    def prepare_horizon_data(self, series_list, horizon):
         """
-        Check if AR parameters satisfy stationarity condition.
-        For AR(p), roots of 1 - φ₁z - φ₂z² - ... - φₚzᵖ = 0 must be outside unit circle.
+        Prepare X (lags) and y (target at horizon h) for training.
+        Target is y_{t+h} relative to the last lag in X.
         """
-        if self.p == 0:
-            return True
-            
-        # Create polynomial coefficients [1, -φ₁, -φ₂, ..., -φₚ]
-        poly_coeffs = np.concatenate([[1], -phi])
-        roots = np.roots(poly_coeffs)
-        
-        # Check if all roots are outside unit circle
-        return np.all(np.abs(roots) > 1.0)
-    
-    def check_invertibility(self, theta):
-        """
-        Check if MA parameters satisfy invertibility condition.
-        For MA(q), roots of 1 + θ₁z + θ₂z² + ... + θₑzᵍ = 0 must be outside unit circle.
-        """
-        if self.q == 0:
-            return True
-            
-        # Create polynomial coefficients [1, θ₁, θ₂, ..., θₑ]
-        poly_coeffs = np.concatenate([[1], theta])
-        roots = np.roots(poly_coeffs)
-        
-        # Check if all roots are outside unit circle
-        return np.all(np.abs(roots) > 1.0)
-    
-    def neg_log_likelihood(self, params, series_list):
-        """
-        Compute negative log-likelihood across multiple series.
-        
-        Parameters:
-        -----------
-        params : array-like
-            [c, φ_1,...,φ_p, θ_1,...,θ_q, log(σ²)]
-        series_list : list of arrays
-            Multiple time series
-            
-        Returns:
-        --------
-        nll : float
-            Negative log-likelihood (to minimize)
-        """
-        # Extract variance (use log parameterization for stability)
-        log_sigma2 = params[-1]
-        sigma2 = np.exp(log_sigma2)
-        
-        # Ensure positive variance
-        if sigma2 <= 0 or not np.isfinite(sigma2):
-            return 1e10
-        
-        theta = params[:-1]
-        total_ll = 0.0
+        X_all = []
+        y_all = []
         
         for series in series_list:
-            # Difference the series
-            z = self.difference(series)
+            # 1. Difference the series
+            z, _ = self.difference(series)
             
-            if len(z) < max(self.p, self.q):
-                warnings.warn("Series too short after differencing for given p, q")
-                return 1e10
-            
-            # Compute residuals
-            e = self.compute_residuals(z, theta)
-            
-            # Log-likelihood (assuming Gaussian errors)
-            ll = -0.5 * np.sum(np.log(2 * np.pi * sigma2) + (e**2) / sigma2)
-            
-            if not np.isfinite(ll):
-                return 1e10
+            if len(z) <= self.p + horizon - 1:
+                continue
                 
-            total_ll += ll
-        
-        return -total_ll  # Return negative for minimization
-    
-    def fit(self, series_list, init_params=None, maxiter=1000):
+            # 2. Create samples
+            # We want to predict z[i + horizon - 1] using z[i-p : i]
+            # i ranges from p to len(z) - horizon
+            
+            for i in range(self.p, len(z) - horizon + 1):
+                # Features: p lags ending at i-1
+                lags = z[i-self.p : i][::-1] # Lags: z[i-1], z[i-2]...
+                
+                # Target: z at horizon steps ahead
+                # If horizon=1, target is z[i]
+                # If horizon=h, target is z[i + h - 1]
+                target = z[i + horizon - 1]
+                
+                X_all.append(lags)
+                y_all.append(target)
+                
+        return np.array(X_all), np.array(y_all)
+
+    def fit(self, series_list, horizons=[1]):
         """
-        Fit the model to multiple series using Maximum Likelihood Estimation.
-        
-        Parameters:
-        -----------
-        series_list : list of arrays
-            Multiple time series (each can be different length)
-        init_params : array-like, optional
-            Initial parameter guess [c, φ_1,...,φ_p, θ_1,...,θ_q, log(σ²)]
-        maxiter : int
-            Maximum iterations for optimizer
-            
-        Returns:
-        --------
-        self : MultiSeriesARIMA
-            Fitted model
+        Train separate models for each horizon.
         """
-        if len(series_list) == 0:
-            raise ValueError("series_list must contain at least one series")
+        print(f"Training Direct Multi-Horizon Models (p={self.p}, d={self.d})...")
         
-        # Validate series
-        for i, series in enumerate(series_list):
-            series_array = np.asarray(series, dtype=float)
-            if len(series_array) <= self.d + max(self.p, self.q):
-                raise ValueError(f"Series {i} too short for ARIMA({self.p},{self.d},{self.q})")
-        
-        # Store original series for inverse differencing
-        self.series_history_ = []
-        for series in series_list:
-            _, history = self.difference(series, return_history=True)
-            self.series_history_.append(history)
-        
-        # Initialize parameters
-        n_params = 1 + self.p + self.q + 1  # c + AR + MA + log(σ²)
-        
-        if init_params is None:
-            # Smarter initialization
-            init_params = np.zeros(n_params)
+        for h in horizons:
+            X, y = self.prepare_horizon_data(series_list, h)
             
-            # Initialize constant as mean of differenced series
-            all_diff = np.concatenate([self.difference(s) for s in series_list])
-            init_params[0] = np.mean(all_diff)
+            if len(X) == 0:
+                print(f"  Warning: Not enough data for horizon {h}")
+                continue
+                
+            if self.ridge_alpha > 0:
+                model = Ridge(alpha=self.ridge_alpha)
+            else:
+                model = LinearRegression()
+                
+            model.fit(X, y)
+            self.models[h] = model
+            # print(f"  Horizon {h}: Trained on {len(X)} samples. R2: {model.score(X, y):.4f}")
             
-            # Initialize AR coefficients small positive
-            init_params[1:1+self.p] = 0.1
-            
-            # Initialize MA coefficients small positive
-            init_params[1+self.p:1+self.p+self.q] = 0.1
-            
-            # Initialize log(σ²) from sample variance
-            init_params[-1] = np.log(np.var(all_diff) + 1e-6)
-        
-        # Optimize
-        result = minimize(
-            self.neg_log_likelihood,
-            init_params,
-            args=(series_list,),
-            method='L-BFGS-B',
-            options={'maxiter': maxiter, 'disp': False}
-        )
-        
-        if not result.success:
-            warnings.warn(f"Optimization did not converge: {result.message}")
-        
-        self.params_ = result.x
         self.fitted_ = True
-        
-        # Check stationarity and invertibility
-        phi = self.params_[1:1+self.p] if self.p > 0 else np.array([])
-        theta = self.params_[1+self.p:1+self.p+self.q] if self.q > 0 else np.array([])
-        
-        if not self.check_stationarity(phi):
-            warnings.warn("AR parameters suggest non-stationary process")
-        
-        if not self.check_invertibility(theta):
-            warnings.warn("MA parameters suggest non-invertible process")
-        
         return self
     
-    def forecast(self, series, steps=1, return_differenced=False):
+    def forecast(self, history, steps=1):
         """
-        Forecast future values for a given series in ORIGINAL scale.
-        
-        Parameters:
-        -----------
-        series : array-like
-            Historical time series (must be one of the series used in fit)
-        steps : int
-            Number of steps ahead to forecast
-        return_differenced : bool
-            If True, return forecasts in differenced space instead of original
-            
-        Returns:
-        --------
-        forecasts : ndarray
-            Forecasted values (in original scale unless return_differenced=True)
+        Forecast up to 'steps' ahead using the specialized model for each step.
         """
         if not self.fitted_:
             raise ValueError("Model must be fitted before forecasting")
+            
+        history = np.asarray(history, dtype=float)
         
-        if steps < 1:
-            raise ValueError("steps must be at least 1")
+        # 1. Difference the history
+        z, diff_history = self.difference(history)
         
-        series = np.asarray(series, dtype=float)
+        if len(z) < self.p:
+            # Not enough history for lags, return last value (naive)
+            return np.full(steps, history[-1])
+            
+        # 2. Extract current lags
+        current_lags = z[-self.p:][::-1].reshape(1, -1)
         
-        # Get differenced series and history
-        z, history = self.difference(series, return_history=True)
-        
-        # Compute residuals for the known series
-        c = self.params_[0]
-        phi = self.params_[1:1+self.p] if self.p > 0 else np.array([])
-        theta = self.params_[1+self.p:1+self.p+self.q] if self.q > 0 else np.array([])
-        
-        e = self.compute_residuals(z, self.params_[:-1])
-        
-        # Prepare for forecasting
-        z_list = list(z)
-        e_list = list(e)
         forecasts_diff = []
         
-        for step in range(steps):
-            # AR component
-            ar_term = 0.0
-            for i in range(self.p):
-                idx = len(z_list) - i - 1
-                if idx >= 0:
-                    ar_term += phi[i] * z_list[idx]
+        # 3. Predict each horizon using its specific model
+        for h in range(1, steps + 1):
+            if h in self.models:
+                pred_diff = self.models[h].predict(current_lags)[0]
+            else:
+                # Fallback to closest model if specific horizon missing
+                available = sorted(self.models.keys())
+                if not available:
+                    pred_diff = 0
+                else:
+                    closest = min(available, key=lambda x: abs(x - h))
+                    pred_diff = self.models[closest].predict(current_lags)[0]
             
-            # MA component (expected future errors = 0)
-            ma_term = 0.0
-            for j in range(self.q):
-                idx = len(e_list) - j - 1
-                if idx >= 0:
-                    ma_term += theta[j] * e_list[idx]
+            forecasts_diff.append(pred_diff)
             
-            # Forecast
-            z_next = c + ar_term + ma_term
-            e_next = 0.0  # Expected error is zero
-            
-            z_list.append(z_next)
-            e_list.append(e_next)
-            forecasts_diff.append(z_next)
+        # 4. Integrate back to original scale
+        # Note: We predicted differences relative to the *end of the history*
+        # For h=1, pred is z_{t+1}
+        # For h=2, pred is z_{t+2}
+        # We need to reconstruct the path: y_{t+1} = y_t + z_{t+1}
+        # y_{t+2} = y_{t+1} + z_{t+2} = y_t + z_{t+1} + z_{t+2}
         
-        forecasts_diff = np.array(forecasts_diff)
+        # Reconstruct cumulative sum of predicted differences
+        # Start from the last observed value in the original scale (undifferenced)
+        # But wait, 'difference' might be d > 1.
         
-        if return_differenced:
-            return forecasts_diff
+        # Simplest way: Append predicted differences to z, then inverse_difference whole thing
+        z_extended = np.concatenate([z, forecasts_diff])
+        history_extended = self.inverse_difference(z_extended, diff_history)
         
-        # Inverse difference to get original scale
-        # Combine last actual values with forecasts
-        combined = np.concatenate([z, forecasts_diff])
-        combined_original = self.inverse_difference(combined, history)
-        
-        # Return only the forecasted portion
-        forecasts_original = combined_original[len(series):]
-        
-        return forecasts_original
-    
-    def get_params(self):
-        """
-        Get fitted parameters as a dictionary.
-        
-        Returns:
-        --------
-        params : dict
-            Dictionary with 'constant', 'ar_coefs', 'ma_coefs', 'sigma2'
-        """
-        if not self.fitted_:
-            raise ValueError("Model must be fitted first")
-        
-        return {
-            'constant': self.params_[0],
-            'ar_coefs': self.params_[1:1+self.p] if self.p > 0 else np.array([]),
-            'ma_coefs': self.params_[1+self.p:1+self.p+self.q] if self.q > 0 else np.array([]),
-            'sigma2': np.exp(self.params_[-1])
-        }
-    
+        # The forecasts are the last 'steps' elements
+        return history_extended[-steps:]
+
     def summary(self):
-        """
-        Print a summary of the fitted model.
-        """
-        if not self.fitted_:
-            print("Model not fitted yet.")
-            return
-        
-        params = self.get_params()
-        
-        print(f"Multi-Series ARIMA({self.p},{self.d},{self.q}) Model")
-        print("=" * 50)
-        print(f"Constant: {params['constant']:.6f}")
-        
-        if self.p > 0:
-            print(f"\nAR Coefficients:")
-            for i, coef in enumerate(params['ar_coefs'], 1):
-                print(f"  φ_{i}: {coef:.6f}")
-            stationary = self.check_stationarity(params['ar_coefs'])
-            print(f"  Stationary: {stationary}")
-        
-        if self.q > 0:
-            print(f"\nMA Coefficients:")
-            for i, coef in enumerate(params['ma_coefs'], 1):
-                print(f"  θ_{i}: {coef:.6f}")
-            invertible = self.check_invertibility(params['ma_coefs'])
-            print(f"  Invertible: {invertible}")
-        
-        print(f"\nError Variance (σ²): {params['sigma2']:.6f}")
-        print("=" * 50)
+        print(f"Direct Multi-Horizon ARI({self.p},{self.d}) Model")
+        print("="*50)
+        print(f"Trained horizons: {sorted(self.models.keys())}")
+        print("="*50)
